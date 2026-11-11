@@ -1,0 +1,19 @@
+[Details]
+  Icon = "Icon.png"
+  Name = "MUALLIM PRO"
+  ID = "com.muallim.pro"
+  Version = "5.5.7"
+  Build = 1
+
+[Merge]
+  [Merge.Linux]
+    Categories = ["Education"]
+    Comment = "Automated grade management for edonish.tj"
+    Exec = "muallim-pro"
+    Icon = "muallim-pro"
+
+  [Merge.Windows]
+    Comment = "Automated grade management for edonish.tj"
+
+  [Merge.Android]
+    Comment = "Automated grade management for edonish.tj"

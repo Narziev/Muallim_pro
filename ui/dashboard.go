@@ -1,0 +1,1293 @@
+package ui
+
+import (
+        "errors"
+        "fmt"
+        "image/color"
+        "strconv"
+        "sync/atomic"
+        "time"
+
+        "fyne.io/fyne/v2"
+        "fyne.io/fyne/v2/canvas"
+        "fyne.io/fyne/v2/container"
+        "fyne.io/fyne/v2/dialog"
+        "fyne.io/fyne/v2/theme"
+        "fyne.io/fyne/v2/widget"
+
+        "github.com/4codegit/MUALLIM_PRO/client"
+)
+
+// ------------------------------------------
+// COLOR PALETTE — Modern Dark-Accent Design
+// ------------------------------------------
+
+// AppVersion is shown in the header. (It used to be hard-coded as "v5.4.6"
+// even in the v5.5.5 release.)
+const AppVersion = "v5.5.7"
+
+var (
+        colorNavBG    = color.NRGBA{R: 15, G: 23, B: 42, A: 255}    // Slate-900
+        colorCardBlue = color.NRGBA{R: 37, G: 99, B: 235, A: 255}   // Blue-600
+        colorAccent   = color.NRGBA{R: 56, G: 189, B: 248, A: 255}  // Sky-400
+        colorSurface  = color.NRGBA{R: 248, G: 250, B: 252, A: 255} // Slate-50
+)
+
+// ------------------------------------------
+// KEYBOARD INTERCEPTOR — grabs Delete/Backspace/Arrow keys
+// even when Entry/Select widgets have focus
+// ------------------------------------------
+
+type keyInterceptor struct {
+        widget.BaseWidget
+        child     fyne.CanvasObject
+        onKeyDown func(*fyne.KeyEvent)
+}
+
+func newKeyInterceptor(child fyne.CanvasObject, onKeyDown func(*fyne.KeyEvent)) *keyInterceptor {
+        ki := &keyInterceptor{child: child, onKeyDown: onKeyDown}
+        ki.ExtendBaseWidget(ki)
+        return ki
+}
+
+func (ki *keyInterceptor) CreateRenderer() fyne.WidgetRenderer {
+        return widget.NewSimpleRenderer(ki.child)
+}
+
+func (ki *keyInterceptor) TypedKey(ev *fyne.KeyEvent) {
+        if ki.onKeyDown != nil {
+                ki.onKeyDown(ev)
+        }
+}
+
+func (ki *keyInterceptor) TypedRune(r rune) {
+        // Do nothing — let the child handle runes
+}
+
+// keyInterceptor implements fyne.Focusable so Canvas.Focus(ki) works.
+func (ki *keyInterceptor) FocusGained() {}
+func (ki *keyInterceptor) FocusLost()   {}
+
+// ------------------------------------------
+// DASHBOARD
+// ------------------------------------------
+
+type Dashboard struct {
+        controller  Controller
+        container   *fyne.Container
+        statusLabel *widget.Label
+
+        // Navigation state
+        contentStack *fyne.Container
+        currentPage  fyne.CanvasObject
+
+        // Bottom tab bar
+        tabBar     *fyne.Container
+        activeTab  int // 0=Журнал, 1=Темы, 2=Дневник, 3=Итоговые
+        tabButtons []*widget.Button
+
+        // Filters state
+        classSel   *widget.Select
+        subjectSel *widget.Select
+        quarterSel *widget.Select
+        refreshBtn *widget.Button
+
+        selectedGroup   *client.JournalGroup
+        selectedSubject *client.Subject
+        selectedQuarter *client.Quarter
+
+        journalOpts *client.JournalOptions
+        dates       []client.Day
+        students    []client.Student
+
+        // Tab content objects
+        gradesTable     *widget.Table
+        gradesContainer *fyne.Container
+        // journalPage is the Journal tab: its own filter row + gradesContainer.
+        // The filters live here (not in the shared top section) so they are not
+        // shown on the other tabs, which have filters of their own.
+        journalPage *fyne.Container
+        keyGrabber  *keyInterceptor // grabs keyboard focus for shortcuts
+
+        // Journal selection state
+        selectedCell *widget.TableCellID
+        deleteBtn    *widget.Button
+
+        // loadSeq numbers journal loads so stale responses can be ignored.
+        loadSeq int64
+        // suppressTap is set while the table is selected programmatically
+        // (arrow keys), so it is not mistaken for a mouse double-click.
+        suppressTap bool
+
+        // Tab objects
+        topicsTab      *TopicsTab
+        diariesTab     *DiariesTab
+        finalGradesTab *FinalGradesTab
+        schoolTab      *SchoolTab
+}
+
+func NewDashboard(c Controller) *Dashboard {
+        d := &Dashboard{
+                controller:  c,
+                statusLabel: widget.NewLabel(""),
+        }
+        d.buildUI()
+        go d.loadJournalOptions()
+        return d
+}
+
+func (d *Dashboard) Container() fyne.CanvasObject {
+        return d.container
+}
+
+// ------------------------------------------
+// UI BUILD
+// ------------------------------------------
+
+func (d *Dashboard) buildUI() {
+        header := d.buildHeader()
+        filters := d.buildFilters()
+
+        d.gradesContainer = container.NewStack(
+                widget.NewLabelWithStyle("Выберите фильтры для загрузки оценок", fyne.TextAlignCenter, fyne.TextStyle{Italic: true}),
+        )
+
+        d.topicsTab = NewTopicsTab(d.controller)
+        d.diariesTab = NewDiariesTab(d.controller)
+        d.finalGradesTab = NewFinalGradesTab(d.controller)
+        d.schoolTab = NewSchoolTab(d.controller)
+
+        d.journalPage = container.NewBorder(
+                container.NewVBox(filters, widget.NewSeparator()),
+                nil, nil, nil,
+                d.gradesContainer,
+        )
+
+        // Start on journal page
+        d.currentPage = d.journalPage
+
+        // Build bottom tab bar
+        d.tabBar = d.buildTabBar()
+
+        topSection := container.NewVBox(header, widget.NewSeparator())
+
+        d.contentStack = container.NewStack(d.currentPage)
+
+        d.container = container.NewBorder(
+                topSection,
+                container.NewVBox(widget.NewSeparator(), d.tabBar),
+                nil,
+                nil,
+                d.contentStack,
+        )
+}
+
+// ------------------------------------------
+// HEADER — Sleek minimal navbar
+// ------------------------------------------
+
+func (d *Dashboard) buildHeader() *fyne.Container {
+        apiClient := d.controller.GetClient()
+
+        userText := ""
+        if apiClient.UserInfo != nil {
+                userText = fmt.Sprintf("%s %s", apiClient.UserInfo.LastName, apiClient.UserInfo.FirstName)
+        }
+
+        roleText := apiClient.Role
+        schoolName := ""
+        for _, sch := range apiClient.Schools {
+                if sch.SchoolID == apiClient.SchoolID {
+                        schoolName = sch.SchoolName
+                        break
+                }
+        }
+
+        appTitle := canvas.NewText("MUALLIM PRO", color.NRGBA{R: 255, G: 255, B: 255, A: 255})
+        appTitle.TextStyle = fyne.TextStyle{Bold: true}
+        appTitle.TextSize = 18
+
+        versionTag := canvas.NewText(AppVersion, colorAccent)
+        versionTag.TextSize = 11
+        versionTag.TextStyle = fyne.TextStyle{Bold: true}
+
+        userLabel := canvas.NewText(userText, color.NRGBA{R: 255, G: 255, B: 255, A: 255})
+        userLabel.TextStyle = fyne.TextStyle{Bold: true}
+        userLabel.TextSize = 14
+
+        roleLabel := canvas.NewText(fmt.Sprintf("%s — %s", roleText, schoolName), color.NRGBA{R: 160, G: 174, B: 192, A: 255})
+        roleLabel.TextSize = 11
+
+        logoutBtn := widget.NewButton("Выйти", d.controller.Logout)
+        logoutBtn.Importance = widget.DangerImportance
+
+        // Theme toggle — cycles Dark → Modern White → Fyne Light.
+        // Uses ColorPaletteIcon because Fyne 2.7.4 doesn't ship a brightness icon.
+        themeBtn := widget.NewButtonWithIcon("Тема", theme.ColorPaletteIcon(), func() {
+                d.controller.ToggleTheme()
+        })
+        themeBtn.Importance = widget.LowImportance
+
+        leftBox := container.NewHBox(appTitle, versionTag)
+        userInfoBox := container.NewVBox(userLabel, roleLabel)
+        rightBox := container.NewHBox(userInfoBox, themeBtn, logoutBtn)
+
+        bg := canvas.NewRectangle(colorNavBG)
+        bg.SetMinSize(fyne.NewSize(0, 52))
+
+        navbar := container.NewBorder(nil, nil, leftBox, rightBox, bg)
+        return container.NewStack(bg, container.NewPadded(navbar))
+}
+
+// ------------------------------------------
+// FILTERS — Clean row
+// ------------------------------------------
+
+func (d *Dashboard) buildFilters() *fyne.Container {
+        d.classSel = widget.NewSelect([]string{}, d.onClassSelected)
+        d.classSel.PlaceHolder = "Класс..."
+
+        d.subjectSel = widget.NewSelect([]string{}, d.onSubjectSelected)
+        d.subjectSel.PlaceHolder = "Предмет..."
+
+        d.quarterSel = widget.NewSelect([]string{}, d.onQuarterSelected)
+        d.quarterSel.PlaceHolder = "Четверть..."
+
+        d.refreshBtn = widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+                go d.loadData()
+        })
+        d.refreshBtn.Disable()
+
+        d.deleteBtn = widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+                d.deleteSelectedCell()
+        })
+        d.deleteBtn.Importance = widget.DangerImportance
+        d.deleteBtn.Disable()
+
+        return container.NewHBox(
+                widget.NewLabel("Фильтры:"),
+                d.classSel,
+                d.subjectSel,
+                d.quarterSel,
+                d.refreshBtn,
+                d.deleteBtn,
+        )
+}
+
+// ------------------------------------------
+// BOTTOM TAB BAR — instant section switching
+// ------------------------------------------
+
+func (d *Dashboard) buildTabBar() *fyne.Container {
+        d.tabButtons = make([]*widget.Button, 5)
+
+        d.tabButtons[0] = widget.NewButton("Журнал", func() {
+                d.switchTab(0, d.journalPage)
+        })
+        d.tabButtons[1] = widget.NewButton("Темы и ДЗ", func() {
+                d.switchTab(1, d.topicsTab.Container())
+        })
+        d.tabButtons[2] = widget.NewButton("Дневник", func() {
+                d.switchTab(2, d.diariesTab.Container())
+        })
+        d.tabButtons[3] = widget.NewButton("Итоговые", func() {
+                d.switchTab(3, d.finalGradesTab.Container())
+        })
+        d.tabButtons[4] = widget.NewButton("Школа", func() {
+                d.switchTab(4, d.schoolTab.Container())
+        })
+
+        // Set initial active style
+        d.activeTab = 0
+        d.highlightActiveTab()
+
+        tabRow := container.NewGridWithColumns(5,
+                d.tabButtons[0], d.tabButtons[1], d.tabButtons[2], d.tabButtons[3], d.tabButtons[4])
+
+        // Status label + tab bar
+        bottomBox := container.NewVBox(
+                d.statusLabel,
+                tabRow,
+        )
+
+        bg := canvas.NewRectangle(colorNavBG)
+        bg.SetMinSize(fyne.NewSize(0, 56))
+
+        return container.NewStack(bg, container.NewPadded(bottomBox))
+}
+
+// highlightActiveTab visually marks the currently active tab button.
+func (d *Dashboard) highlightActiveTab() {
+        for i, btn := range d.tabButtons {
+                if i == d.activeTab {
+                        btn.Importance = widget.HighImportance
+                } else {
+                        btn.Importance = widget.MediumImportance
+                }
+                btn.Refresh()
+        }
+}
+
+func (d *Dashboard) switchTab(idx int, page fyne.CanvasObject) {
+        d.activeTab = idx
+        d.currentPage = page
+        d.contentStack.Objects = []fyne.CanvasObject{page}
+        d.contentStack.Refresh()
+        d.highlightActiveTab()
+}
+
+// ------------------------------------------
+// DATA LOADING
+// ------------------------------------------
+
+func (d *Dashboard) loadJournalOptions() {
+        // Runs in a goroutine: every widget change must go through fyne.Do.
+        fyne.Do(func() {
+                d.statusLabel.SetText("Загрузка настроек журнала...")
+        })
+        opts, err := d.controller.GetClient().GetJournalOptions()
+        if err != nil {
+                fyne.Do(func() {
+                        d.statusLabel.SetText(fmt.Sprintf("Ошибка загрузки: %v", err))
+                })
+                return
+        }
+
+        classNames := make([]string, len(opts.Groups))
+        for i, g := range opts.Groups {
+                classNames[i] = fmt.Sprintf("%d %s", g.Number, g.Name)
+        }
+
+        fyne.Do(func() {
+                d.journalOpts = opts
+                d.classSel.Options = classNames
+                d.classSel.Refresh()
+                d.statusLabel.SetText("")
+                if len(classNames) > 0 {
+                        d.classSel.SetSelectedIndex(0)
+                }
+        })
+}
+
+// ------------------------------------------
+// FILTER HANDLERS
+// ------------------------------------------
+
+func (d *Dashboard) onClassSelected(selected string) {
+        if d.journalOpts == nil {
+                return
+        }
+        var group *client.JournalGroup
+        for i, g := range d.journalOpts.Groups {
+                if fmt.Sprintf("%d %s", g.Number, g.Name) == selected {
+                        group = &d.journalOpts.Groups[i]
+                        break
+                }
+        }
+        if group == nil {
+                return
+        }
+        d.selectedGroup = group
+
+        // Remember the previously selected subject name
+        prevSubjectName := ""
+        if d.selectedSubject != nil {
+                prevSubjectName = d.selectedSubject.SubjectName
+        }
+        // Remember previously selected quarter
+        prevQuarterName := ""
+        if d.selectedQuarter != nil {
+                prevQuarterName = d.selectedQuarter.Name
+        }
+
+        d.selectedSubject = nil
+        d.selectedQuarter = nil
+
+        subjectNames := make([]string, len(d.selectedGroup.Subjects))
+        for i, s := range d.selectedGroup.Subjects {
+                subjectNames[i] = s.SubjectName
+        }
+
+        quarterNames := make([]string, len(d.selectedGroup.Quarters))
+        for i, q := range d.selectedGroup.Quarters {
+                quarterNames[i] = q.Name
+        }
+
+        fyne.Do(func() {
+                d.subjectSel.Options = subjectNames
+                d.subjectSel.Refresh()
+                d.quarterSel.Options = quarterNames
+                d.quarterSel.Refresh()
+                d.refreshBtn.Disable()
+
+                // Clear first: Select.SetSelectedIndex does NOT fire OnChanged
+                // when the same value is already selected. Without this, switching
+                // to another class that has the same subject/quarter names left
+                // selectedSubject/selectedQuarter nil and the journal never reloaded.
+                d.subjectSel.ClearSelected()
+                d.quarterSel.ClearSelected()
+
+                // Try to keep the same subject if it exists in the new class
+                subjectFound := false
+                if prevSubjectName != "" {
+                        for i, name := range subjectNames {
+                                if name == prevSubjectName {
+                                        d.subjectSel.SetSelectedIndex(i)
+                                        subjectFound = true
+                                        break
+                                }
+                        }
+                }
+                if !subjectFound && len(subjectNames) > 0 {
+                        d.subjectSel.SetSelectedIndex(0)
+                }
+
+                // Try to keep the same quarter
+                quarterFound := false
+                if prevQuarterName != "" {
+                        for i, name := range quarterNames {
+                                if name == prevQuarterName {
+                                        d.quarterSel.SetSelectedIndex(i)
+                                        quarterFound = true
+                                        break
+                                }
+                        }
+                }
+                if !quarterFound {
+                        // Default to current quarter
+                        for i, q := range d.selectedGroup.Quarters {
+                                if q.CurrentQuarter {
+                                        d.quarterSel.SetSelectedIndex(i)
+                                        break
+                                }
+                        }
+                }
+        })
+}
+
+func (d *Dashboard) onSubjectSelected(selected string) {
+        if d.selectedGroup == nil {
+                return
+        }
+        for i, s := range d.selectedGroup.Subjects {
+                if s.SubjectName == selected {
+                        d.selectedSubject = &d.selectedGroup.Subjects[i]
+                        break
+                }
+        }
+        d.checkFilterCompletion()
+}
+
+func (d *Dashboard) onQuarterSelected(selected string) {
+        if d.selectedGroup == nil {
+                return
+        }
+        for i, q := range d.selectedGroup.Quarters {
+                if q.Name == selected {
+                        d.selectedQuarter = &d.selectedGroup.Quarters[i]
+                        break
+                }
+        }
+        d.checkFilterCompletion()
+}
+
+func (d *Dashboard) checkFilterCompletion() {
+        ready := d.selectedGroup != nil && d.selectedSubject != nil && d.selectedQuarter != nil
+        if ready {
+                d.refreshBtn.Enable()
+                go d.loadData()
+        } else {
+                d.refreshBtn.Disable()
+        }
+}
+
+func (d *Dashboard) loadData() {
+        if d.selectedGroup == nil || d.selectedSubject == nil || d.selectedQuarter == nil {
+                return
+        }
+
+        fyne.Do(func() {
+                d.statusLabel.SetText("Загрузка данных журнала...")
+        })
+
+        apiClient := d.controller.GetClient()
+        gID := d.selectedGroup.ID
+        sID := d.selectedSubject.SubjectID
+        qID := d.selectedQuarter.ID
+
+        // Each load gets a sequence number; if the user switches filters while
+        // an older request is still in flight, its (stale) result is dropped.
+        seq := atomic.AddInt64(&d.loadSeq, 1)
+
+        students, errS := apiClient.GetJournalStudents(gID, sID, qID)
+        dates, errD := apiClient.GetJournalDates(gID, sID, qID)
+
+        fyne.Do(func() {
+                if atomic.LoadInt64(&d.loadSeq) != seq {
+                        return
+                }
+                if errS != nil || errD != nil {
+                        msg := ""
+                        if errS != nil {
+                                msg = fmt.Sprintf("Ошибка учеников: %v", errS)
+                        } else {
+                                msg = fmt.Sprintf("Ошибка дат: %v", errD)
+                        }
+                        d.statusLabel.SetText(msg)
+                        dialog.ShowError(errors.New(msg), d.controller.GetWindow())
+                        return
+                }
+
+                d.students = students
+                d.dates = dates
+                d.selectedCell = nil
+                d.deleteBtn.Disable()
+
+                if len(students) == 0 {
+                        d.statusLabel.SetText("Нет данных")
+                } else {
+                        d.statusLabel.SetText(fmt.Sprintf("Загружено: %d учеников, %d дат", len(students), len(dates)))
+                }
+
+                d.rebuildGradesTable()
+        })
+}
+
+// ------------------------------------------
+// GRADES TABLE — selection, arrows, Enter, Delete
+// ------------------------------------------
+
+func (d *Dashboard) rebuildGradesTable() {
+        if len(d.students) == 0 || len(d.dates) == 0 {
+                d.gradesContainer.Objects = []fyne.CanvasObject{
+                        widget.NewLabelWithStyle("Нет данных для отображения", fyne.TextAlignCenter, fyne.TextStyle{Italic: true}),
+                }
+                d.gradesContainer.Refresh()
+                return
+        }
+
+        // Columns: № | ФИО | date1 | date2 | ... | dateN | Ср.балл
+        numDateCols := len(d.dates)
+        totalCols := 2 + numDateCols + 1 // №, ФИО, dates, avg
+        rowCount := len(d.students) + 1  // +1 header
+
+        d.gradesTable = widget.NewTable(
+                func() (int, int) { return rowCount, totalCols },
+                func() fyne.CanvasObject {
+                        lbl := widget.NewLabel("")
+                        lbl.Alignment = fyne.TextAlignCenter
+                        lbl.Wrapping = fyne.TextWrapOff
+                        return container.NewMax(lbl)
+                },
+                func(id widget.TableCellID, cell fyne.CanvasObject) {
+                        c := cell.(*fyne.Container)
+                        lbl := c.Objects[0].(*widget.Label)
+                        lbl.SetText("—")
+                        lbl.Alignment = fyne.TextAlignCenter
+                        lbl.TextStyle = fyne.TextStyle{}
+
+                        // Header row
+                        if id.Row == 0 {
+                                lbl.TextStyle = fyne.TextStyle{Bold: true}
+                                switch id.Col {
+                                case 0:
+                                        lbl.SetText("№")
+                                case 1:
+                                        lbl.SetText("ФИО ученика")
+                                        lbl.Alignment = fyne.TextAlignLeading
+                                case totalCols - 1:
+                                        lbl.SetText("Ср.")
+                                default:
+                                        dateIdx := id.Col - 2
+                                        if dateIdx >= 0 && dateIdx < len(d.dates) {
+                                                day := d.dates[dateIdx]
+                                                lbl.SetText(day.WeekdayShortName + "\n" + shortDate(day.AssignmentDate))
+                                        }
+                                }
+                                return
+                        }
+
+                        // Data rows
+                        studentIdx := id.Row - 1
+                        if studentIdx >= len(d.students) {
+                                return
+                        }
+                        student := d.students[studentIdx]
+
+                        switch id.Col {
+                        case 0:
+                                lbl.SetText(strconv.Itoa(studentIdx + 1))
+                        case 1:
+                                lbl.SetText(fmt.Sprintf("%s %s", student.LastName, student.FirstName))
+                                lbl.Alignment = fyne.TextAlignLeading
+                        case totalCols - 1:
+                                if student.AverageScore != "" && student.AverageScore != "0.0" {
+                                        lbl.SetText(student.AverageScore)
+                                }
+                        default:
+                                dateIdx := id.Col - 2
+                                if dateIdx >= 0 && dateIdx < len(d.dates) {
+                                        dateID := d.dates[dateIdx].AssignmentDateID
+                                        for _, sm := range student.SubjectMarks {
+                                                if sm.AssignmentDateID == dateID {
+                                                        lbl.SetText(sm.ShortName)
+                                                        break
+                                                }
+                                        }
+                                }
+                        }
+                },
+        )
+
+        // Set column widths
+        d.gradesTable.SetColumnWidth(0, 40)  // №
+        d.gradesTable.SetColumnWidth(1, 180) // ФИО
+        for i := 0; i < numDateCols; i++ {
+                d.gradesTable.SetColumnWidth(2+i, 50) // date columns
+        }
+        d.gradesTable.SetColumnWidth(totalCols-1, 50) // avg
+        // Header cells contain two lines ("Пн\n09-01") — give the row room
+        // for both, otherwise the date is clipped.
+        d.gradesTable.SetRowHeight(0, 2*theme.TextSize()+4*theme.Padding())
+
+        // Track selection state — time-based double-click detection
+        // We track the last tap time and cell to detect double-clicks within 600ms.
+        // After each selection, we immediately unselect so that clicking the same
+        // cell again triggers OnSelected (Fyne Table silently ignores Select on
+        // already-selected cells).
+        var lastTapTime time.Time
+        var lastTapCell widget.TableCellID
+
+        d.gradesTable.OnSelected = func(id widget.TableCellID) {
+                // Track selected cell
+                d.selectedCell = &id
+
+                // Enable delete button if a grade cell is selected
+                if id.Row > 0 && id.Col >= 2 && id.Col < totalCols-1 {
+                        d.deleteBtn.Enable()
+                } else {
+                        d.deleteBtn.Disable()
+                }
+
+                // Grab keyboard focus so Delete/Backspace/Arrow keys work
+                d.focusKeyGrabber()
+
+                // Programmatic selection (arrow keys) is not a mouse tap:
+                // pressing an arrow twice at the table edge must not open a dialog.
+                if d.suppressTap {
+                        lastTapTime = time.Time{}
+                        d.gradesTable.Unselect(id)
+                        d.selectedCell = &id
+                        return
+                }
+
+                // Time-based double-click detection (600ms window)
+                now := time.Now()
+                isDoubleTap := id == lastTapCell && now.Sub(lastTapTime) < 600*time.Millisecond
+
+                if isDoubleTap {
+                        // Reset tap tracking
+                        lastTapTime = time.Time{}
+                        lastTapCell = widget.TableCellID{}
+
+                        // Double-click on student name column (col 1) → random fill all dates
+                        if id.Row > 0 && id.Col == 1 {
+                                studentIdx := id.Row - 1
+                                if studentIdx < len(d.students) {
+                                        d.showRandomFillForStudent(studentIdx)
+                                }
+                                // Unselect so next click re-triggers OnSelected
+                                d.gradesTable.Unselect(id)
+                                d.selectedCell = &id
+                                return
+                        }
+
+                        // Double-click on a grade cell (date column) → edit single grade
+                        if id.Row > 0 && id.Col >= 2 && id.Col < totalCols-1 {
+                                studentIdx := id.Row - 1
+                                dateIdx := id.Col - 2
+                                if studentIdx < len(d.students) && dateIdx < len(d.dates) {
+                                        d.showEditGradePopup(studentIdx, dateIdx)
+                                }
+                                d.gradesTable.Unselect(id)
+                                d.selectedCell = &id
+                                return
+                        }
+                } else {
+                        // Single click — record for potential double-click
+                        lastTapTime = now
+                        lastTapCell = id
+                }
+
+                // Immediately unselect so the next click on the SAME cell triggers
+                // OnSelected again. Fyne Table.Select() returns early if already selected.
+                // We preserve d.selectedCell so Delete/Backspace/Arrows still work.
+                d.gradesTable.Unselect(id)
+                d.selectedCell = &id
+        }
+
+        // Wrap table in scroll for cross-platform responsiveness (horizontal + vertical)
+        scrollWrap := container.NewScroll(d.gradesTable)
+        scrollWrap.Direction = container.ScrollBoth
+
+        // Wrap in keyInterceptor so Delete/Backspace/Arrows are ALWAYS captured,
+        // even when Select/Entry widgets have focus.
+        d.keyGrabber = newKeyInterceptor(scrollWrap, func(ev *fyne.KeyEvent) {
+                if d.gradesTable == nil || d.currentPage != d.journalPage {
+                        return
+                }
+                switch ev.Name {
+                case fyne.KeyUp:
+                        d.navigateCell(0, -1)
+                case fyne.KeyDown:
+                        d.navigateCell(0, 1)
+                case fyne.KeyLeft:
+                        d.navigateCell(-1, 0)
+                case fyne.KeyRight:
+                        d.navigateCell(1, 0)
+                case fyne.KeyDelete, fyne.KeyBackspace:
+                        d.deleteSelectedCell()
+                }
+        })
+
+        d.gradesContainer.Objects = []fyne.CanvasObject{d.keyGrabber}
+        d.gradesContainer.Refresh()
+
+        // Install canvas-level keyboard handler as fallback
+        d.installKeyboardHandler()
+}
+
+// ------------------------------------------
+// KEYBOARD HANDLER — Arrow keys + Delete key
+// ------------------------------------------
+
+// focusKeyGrabber moves keyboard focus to the keyInterceptor widget,
+// so Delete/Backspace/Arrow keys are captured instead of being consumed
+// by Entry or Select widgets.
+func (d *Dashboard) focusKeyGrabber() {
+        if d.keyGrabber == nil {
+                return
+        }
+        w := d.controller.GetWindow()
+        if w == nil {
+                return
+        }
+        c := w.Canvas()
+        if c == nil {
+                return
+        }
+        c.Focus(d.keyGrabber)
+}
+
+// installKeyboardHandler sets up arrow key navigation and Delete key on the
+// window's canvas as a FALLBACK. The primary handler is the keyInterceptor.
+func (d *Dashboard) installKeyboardHandler() {
+        w := d.controller.GetWindow()
+        if w == nil {
+                return
+        }
+        c := w.Canvas()
+        if c == nil {
+                return
+        }
+
+        c.SetOnTypedKey(func(ev *fyne.KeyEvent) {
+                // Only handle when the journal table is visible
+                if d.gradesTable == nil || d.currentPage != d.journalPage {
+                        return
+                }
+
+                switch ev.Name {
+                case fyne.KeyUp:
+                        d.navigateCell(0, -1)
+                case fyne.KeyDown:
+                        d.navigateCell(0, 1)
+                case fyne.KeyLeft:
+                        d.navigateCell(-1, 0)
+                case fyne.KeyRight:
+                        d.navigateCell(1, 0)
+                case fyne.KeyDelete, fyne.KeyBackspace:
+                        d.deleteSelectedCell()
+                }
+        })
+}
+
+// navigateCell moves the selected cell by (dCol, dRow) and selects it.
+// It clamps to valid cell boundaries within the journal table.
+func (d *Dashboard) navigateCell(dCol, dRow int) {
+        if d.gradesTable == nil {
+                return
+        }
+
+        rowCount := len(d.students) + 1 // +1 header
+        numDateCols := len(d.dates)
+        totalCols := 2 + numDateCols + 1
+
+        d.suppressTap = true
+        defer func() { d.suppressTap = false }()
+
+        // If no cell selected yet, start at first data cell
+        if d.selectedCell == nil {
+                if rowCount < 2 || numDateCols == 0 {
+                        return
+                }
+                start := widget.TableCellID{Row: 1, Col: 2}
+                d.selectedCell = &start
+                d.gradesTable.Select(start)
+                d.deleteBtn.Enable()
+                return
+        }
+
+        newCol := d.selectedCell.Col + dCol
+        newRow := d.selectedCell.Row + dRow
+
+        // Clamp to table bounds
+        if newCol < 0 {
+                newCol = 0
+        }
+        if newCol >= totalCols {
+                newCol = totalCols - 1
+        }
+        if newRow < 0 {
+                newRow = 0
+        }
+        if newRow >= rowCount {
+                newRow = rowCount - 1
+        }
+
+        newID := widget.TableCellID{Row: newRow, Col: newCol}
+        d.selectedCell = &newID
+        d.gradesTable.Select(newID)
+
+        // Enable/disable delete button based on whether it's a grade cell
+        if newRow > 0 && newCol >= 2 && newCol < totalCols-1 {
+                d.deleteBtn.Enable()
+        } else {
+                d.deleteBtn.Disable()
+        }
+}
+
+// ------------------------------------------
+// DELETE SELECTED CELL
+// ------------------------------------------
+
+func (d *Dashboard) deleteSelectedCell() {
+        if d.selectedCell == nil || d.students == nil || d.dates == nil {
+                return
+        }
+
+        id := *d.selectedCell
+        numDateCols := len(d.dates)
+        totalCols := 2 + numDateCols + 1
+
+        // Only grade cells (date columns)
+        if id.Row <= 0 || id.Col < 2 || id.Col >= totalCols-1 {
+                return
+        }
+
+        studentIdx := id.Row - 1
+        dateIdx := id.Col - 2
+
+        if studentIdx >= len(d.students) || dateIdx >= len(d.dates) {
+                return
+        }
+
+        student := d.students[studentIdx]
+        date := d.dates[dateIdx]
+
+        // Find the mark ID for this cell
+        var markID string
+        var currentGrade string
+        for _, sm := range student.SubjectMarks {
+                if sm.AssignmentDateID == date.AssignmentDateID {
+                        if sm.AssignmentMarkID != "" {
+                                markID = sm.AssignmentMarkID
+                                currentGrade = sm.ShortName
+                        }
+                        break
+                }
+        }
+
+        if markID == "" {
+                d.statusLabel.SetText("Ячейка пуста — нечего удалять")
+                return
+        }
+
+        confirmMsg := fmt.Sprintf("Удалить оценку %s для %s %s — %s?",
+                currentGrade, student.LastName, student.FirstName,
+                shortDate(date.AssignmentDate))
+
+        dialog.ShowConfirm("Удалить оценку", confirmMsg, func(ok bool) {
+                if !ok {
+                        return
+                }
+                go func() {
+                        err := d.controller.GetClient().DeleteMark(markID)
+                        fyne.Do(func() {
+                                if err != nil {
+                                        dialog.ShowError(fmt.Errorf("Ошибка удаления: %v", err), d.controller.GetWindow())
+                                } else {
+                                        d.statusLabel.SetText(fmt.Sprintf("Оценка удалена: %s %s — %s",
+                                                student.LastName, student.FirstName, shortDate(date.AssignmentDate)))
+                                        // Update local data immediately without full reload
+                                        d.removeMarkFromStudent(studentIdx, date.AssignmentDateID)
+                                        // Recalculate average asynchronously
+                                        go d.recalcAveragesAsync()
+                                        // Redraw the table. (Select() here used to
+                                        // register a fake "tap", so the next real
+                                        // click on that cell opened the editor.)
+                                        d.gradesTable.Refresh()
+                                }
+                        })
+                }()
+        }, d.controller.GetWindow())
+}
+
+// removeMarkFromStudent removes a mark from the local student data without API call.
+func (d *Dashboard) removeMarkFromStudent(studentIdx int, assignmentDateID string) {
+        if studentIdx >= len(d.students) {
+                return
+        }
+        student := &d.students[studentIdx]
+        for i, sm := range student.SubjectMarks {
+                if sm.AssignmentDateID == assignmentDateID {
+                        student.SubjectMarks[i].AssignmentMarkID = ""
+                        student.SubjectMarks[i].ShortName = ""
+                        student.SubjectMarks[i].IsNum = false
+                        break
+                }
+        }
+}
+
+// updateMarkInStudent updates a mark in the local student data after CreateMark success.
+func (d *Dashboard) updateMarkInStudent(studentIdx int, assignmentDateID string, grade int) {
+        if studentIdx >= len(d.students) {
+                return
+        }
+        student := &d.students[studentIdx]
+        gradeStr := strconv.Itoa(grade)
+        for i, sm := range student.SubjectMarks {
+                if sm.AssignmentDateID == assignmentDateID {
+                        student.SubjectMarks[i].ShortName = gradeStr
+                        student.SubjectMarks[i].IsNum = true
+                        return
+                }
+        }
+        // An empty cell usually has no SubjectMark entry at all — add one,
+        // otherwise the new grade was not shown until a manual reload.
+        // (Its mark ID arrives with the refresh in recalcAveragesAsync.)
+        student.SubjectMarks = append(student.SubjectMarks, client.SubjectMark{
+                AssignmentDateID: assignmentDateID,
+                ShortName:        gradeStr,
+                IsNum:            true,
+        })
+}
+
+// recalcAveragesAsync re-fetches the students of the current journal and
+// refreshes marks (incl. their server IDs, needed for deletion) and averages.
+//
+// Previously it only copied averages — via goroutines writing d.students
+// concurrently, which was a data race — so a freshly created mark had no ID
+// and could not be deleted until a full reload.
+func (d *Dashboard) recalcAveragesAsync() {
+        var gID, sID, qID int
+        ok := false
+        fyne.DoAndWait(func() {
+                if d.selectedGroup == nil || d.selectedSubject == nil || d.selectedQuarter == nil {
+                        return
+                }
+                gID, sID, qID = d.selectedGroup.ID, d.selectedSubject.SubjectID, d.selectedQuarter.ID
+                ok = true
+        })
+        if !ok {
+                return
+        }
+        seq := atomic.LoadInt64(&d.loadSeq)
+
+        students, err := d.controller.GetClient().GetJournalStudents(gID, sID, qID)
+        if err != nil {
+                return
+        }
+
+        fyne.Do(func() {
+                // Filters changed meanwhile — this data belongs to another journal.
+                if d.gradesTable == nil || atomic.LoadInt64(&d.loadSeq) != seq {
+                        return
+                }
+                byID := make(map[int]client.Student, len(students))
+                for _, s := range students {
+                        byID[s.StudentID] = s
+                }
+                for j := range d.students {
+                        if fresh, found := byID[d.students[j].StudentID]; found {
+                                d.students[j].AverageScore = fresh.AverageScore
+                                d.students[j].SubjectMarks = fresh.SubjectMarks
+                        }
+                }
+                d.gradesTable.Refresh()
+        })
+}
+
+// ------------------------------------------
+// EDIT GRADE POPUP — double-click on a grade cell
+// ------------------------------------------
+
+func (d *Dashboard) showEditGradePopup(studentIdx, dateIdx int) {
+        student := d.students[studentIdx]
+        date := d.dates[dateIdx]
+
+        // Find current mark
+        var currentMark string
+        for _, sm := range student.SubjectMarks {
+                if sm.AssignmentDateID == date.AssignmentDateID {
+                        currentMark = sm.ShortName
+                        break
+                }
+        }
+
+        gradeEntry := widget.NewEntry()
+        gradeEntry.SetPlaceHolder("2-10")
+        if currentMark != "" && currentMark != "—" {
+                gradeEntry.SetText(currentMark)
+        }
+
+        header := fmt.Sprintf("%s %s — %s (%s)",
+                student.LastName, student.FirstName,
+                date.WeekdayShortName, shortDate(date.AssignmentDate))
+
+        content := container.NewVBox(
+                widget.NewLabelWithStyle(header, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+                widget.NewSeparator(),
+                container.NewGridWithColumns(2,
+                        widget.NewLabel("Оценка (2-10):"),
+                        gradeEntry,
+                ),
+        )
+
+        dialog.ShowForm("Оценка", "Сохранить", "Отмена", []*widget.FormItem{
+                widget.NewFormItem("", content),
+        }, func(ok bool) {
+                if !ok {
+                        return
+                }
+                gradeStr := gradeEntry.Text
+                if gradeStr == "" {
+                        return
+                }
+                grade, err := strconv.Atoi(gradeStr)
+                if err != nil || grade < 2 || grade > 10 {
+                        dialog.ShowError(fmt.Errorf("Оценка от 2 до 10"), d.controller.GetWindow())
+                        return
+                }
+
+                if d.selectedQuarter == nil {
+                        return
+                }
+                // Read on the UI thread, not inside the goroutine.
+                quarterID := d.selectedQuarter.ID
+                go func() {
+                        err := d.controller.GetClient().CreateMark(
+                                student.StudentID,
+                                date.AssignmentDateID,
+                                quarterID,
+                                grade,
+                        )
+                        fyne.Do(func() {
+                                if err != nil {
+                                        dialog.ShowError(fmt.Errorf("Ошибка: %v", err), d.controller.GetWindow())
+                                } else {
+                                        d.statusLabel.SetText(fmt.Sprintf("Оценка %d: %s %s — %s",
+                                                grade, student.LastName, student.FirstName, shortDate(date.AssignmentDate)))
+                                        // Update local mark data immediately
+                                        d.updateMarkInStudent(studentIdx, date.AssignmentDateID, grade)
+                                        // Recalculate averages asynchronously
+                                        go d.recalcAveragesAsync()
+                                        // Refresh table display
+                                        d.gradesTable.Refresh()
+                                }
+                        })
+                }()
+        }, d.controller.GetWindow())
+}
+
+// ------------------------------------------
+// RANDOM FILL FOR STUDENT — double-click on name
+// Fills ALL empty dates in the current quarter
+// ------------------------------------------
+
+func (d *Dashboard) showRandomFillForStudent(studentIdx int) {
+        student := d.students[studentIdx]
+
+        minEntry := widget.NewEntry()
+        minEntry.SetPlaceHolder("2")
+        minEntry.SetText("7")
+
+        maxEntry := widget.NewEntry()
+        maxEntry.SetPlaceHolder("10")
+        maxEntry.SetText("10")
+
+        comboSel := widget.NewSelect(comboNames(), func(sel string) {
+                for _, c := range GradeCombos {
+                        if c.Name == sel {
+                                minEntry.SetText(strconv.Itoa(c.MinVal))
+                                maxEntry.SetText(strconv.Itoa(c.MaxVal))
+                                break
+                        }
+                }
+        })
+        comboSel.PlaceHolder = "Быстрый выбор..."
+
+        // Count empty dates for this student
+        emptyCount := 0
+        for _, date := range d.dates {
+                hasMark := false
+                for _, sm := range student.SubjectMarks {
+                        if sm.AssignmentDateID == date.AssignmentDateID && sm.ShortName != "" && sm.ShortName != "—" {
+                                hasMark = true
+                                break
+                        }
+                }
+                if !hasMark {
+                        emptyCount++
+                }
+        }
+
+        quarterName := ""
+        if d.selectedQuarter != nil {
+                quarterName = d.selectedQuarter.Name
+        }
+
+        header := fmt.Sprintf("%s %s — %s",
+                student.LastName, student.FirstName, quarterName)
+
+        infoText := fmt.Sprintf("Пустых дат: %d из %d", emptyCount, len(d.dates))
+
+        content := container.NewVBox(
+                widget.NewLabelWithStyle(header, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+                widget.NewLabel(infoText),
+                widget.NewSeparator(),
+                widget.NewLabel("Быстрый диапазон:"),
+                comboSel,
+                widget.NewSeparator(),
+                container.NewGridWithColumns(2,
+                        widget.NewLabel("Мин. оценка:"),
+                        minEntry,
+                        widget.NewLabel("Макс. оценка:"),
+                        maxEntry,
+                ),
+                widget.NewSeparator(),
+                widget.NewLabelWithStyle(fmt.Sprintf("Будут выставлены случайные оценки (%d шт) на все пустые даты", emptyCount),
+                        fyne.TextAlignCenter, fyne.TextStyle{Italic: true}),
+        )
+
+        dialog.ShowForm("Рандомные оценки — все даты", "Заполнить", "Отмена", []*widget.FormItem{
+                widget.NewFormItem("", content),
+        }, func(ok bool) {
+                if !ok {
+                        return
+                }
+                minVal, err1 := strconv.Atoi(minEntry.Text)
+                maxVal, err2 := strconv.Atoi(maxEntry.Text)
+                if err1 != nil || err2 != nil {
+                        dialog.ShowError(errors.New("Введите корректные числа"), d.controller.GetWindow())
+                        return
+                }
+                if minVal > maxVal {
+                        minVal, maxVal = maxVal, minVal
+                }
+                // Previously any number was accepted (e.g. 0 or 15) and sent to
+                // the server as a grade.
+                if minVal < 2 || maxVal > 10 {
+                        dialog.ShowError(errors.New("Оценки должны быть от 2 до 10"), d.controller.GetWindow())
+                        return
+                }
+                if d.selectedQuarter == nil {
+                        return
+                }
+
+                // Snapshot everything the background job needs on the UI thread.
+                dates := append([]client.Day(nil), d.dates...)
+                go d.executeRandomFillForStudent(studentIdx, student, dates, d.selectedQuarter.ID, minVal, maxVal)
+        }, d.controller.GetWindow())
+}
+
+func (d *Dashboard) executeRandomFillForStudent(studentIdx int, student client.Student, dates []client.Day, quarterID, minVal, maxVal int) {
+        apiClient := d.controller.GetClient()
+        seq := atomic.LoadInt64(&d.loadSeq)
+
+        successCount := 0
+        skipCount := 0
+        failCount := 0
+        var firstErr error
+
+        for _, date := range dates {
+                // Skip dates that already have a mark
+                hasMark := false
+                for _, sm := range student.SubjectMarks {
+                        if sm.AssignmentDateID == date.AssignmentDateID && sm.ShortName != "" && sm.ShortName != "—" {
+                                hasMark = true
+                                break
+                        }
+                }
+                if hasMark {
+                        skipCount++
+                        continue
+                }
+
+                grade := RandomGradeInRange(minVal, maxVal)
+                done := successCount + failCount
+
+                fyne.Do(func() {
+                        d.statusLabel.SetText(fmt.Sprintf("Ставлю %d: %s %s — %s (%d/%d)",
+                                grade, student.LastName, student.FirstName, shortDate(date.AssignmentDate),
+                                done+1, len(dates)-skipCount))
+                })
+
+                err := apiClient.CreateMark(
+                        student.StudentID,
+                        date.AssignmentDateID,
+                        quarterID,
+                        grade,
+                )
+                if err == nil {
+                        successCount++
+                        // Update local data on the UI thread (it used to be written
+                        // from this goroutine while the table was reading it).
+                        dateID := date.AssignmentDateID
+                        fyne.Do(func() {
+                                if atomic.LoadInt64(&d.loadSeq) == seq {
+                                        d.updateMarkInStudent(studentIdx, dateID, grade)
+                                }
+                        })
+                } else {
+                        failCount++
+                        if firstErr == nil {
+                                firstErr = err
+                        }
+                }
+        }
+
+        fyne.Do(func() {
+                msg := fmt.Sprintf("Готово: %d оценок для %s %s (пропущено: %d, ошибок: %d)",
+                        successCount, student.LastName, student.FirstName, skipCount, failCount)
+                if firstErr != nil {
+                        msg += " | первая ошибка: " + firstErr.Error()
+                }
+                d.statusLabel.SetText(msg)
+                // Recalculate averages asynchronously instead of full reload
+                go d.recalcAveragesAsync()
+                // Refresh table to show updated grades
+                if d.gradesTable != nil {
+                        d.gradesTable.Refresh()
+                }
+        })
+}
+
+// comboNames returns list of grade combo names for UI selector.
+func comboNames() []string {
+        names := make([]string, len(GradeCombos))
+        for i, c := range GradeCombos {
+                names[i] = c.Name
+        }
+        return names
+}

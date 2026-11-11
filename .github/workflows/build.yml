@@ -1,0 +1,357 @@
+name: Build and Release
+
+env:
+  MESA_VERSION: 26.1.1
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-amd64
+            output: muallim-pro
+          - os: windows-latest
+            target: windows-amd64
+            output: muallim-pro.exe
+          - os: macos-latest
+            target: macos-amd64
+            output: muallim-pro-mac
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgl1-mesa-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libxxf86vm-dev libglu1-mesa-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config
+
+      - name: Get version from tag or config
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(grep 'Version = ' FyneApp.toml | awk -F'"' '{print $2}')
+            echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          fi
+          echo "Building version: ${{ steps.version.outputs.VERSION }}"
+        shell: bash
+
+      - name: Download dependencies
+        run: GONOSUMCHECK=* GOFLAGS=-insecure go mod tidy
+        shell: bash
+
+      - name: Force baseline x86-64 for Linux (support old CPUs)
+        if: runner.os == 'Linux'
+        run: |
+          echo "GOAMD64=v1" >> $GITHUB_ENV
+          echo "CGO_CFLAGS=-O2 -march=x86-64 -mtune=generic" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Build
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go build -ldflags "-s -w -X main.version=${{ steps.version.outputs.VERSION }}" -o ${{ matrix.output }} .
+        shell: bash
+
+      - name: Verify Linux binary runs on baseline x86-64 CPUs
+        if: runner.os == 'Linux'
+        run: |
+          readelf -n ${{ matrix.output }} | grep -i "ISA" || true
+          if readelf -n ${{ matrix.output }} | grep -qE "x86-64-v[234]"; then
+            echo "::error::Binary requires x86-64-v2/v3/v4 — it will not start on older CPUs"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Bundle Windows portable package with Mesa OpenGL
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mesaArchive = "mesa3d-$env:MESA_VERSION-release-msvc.7z"
+          curl.exe -L --retry 3 --output $mesaArchive --url "https://github.com/pal1000/mesa-dist-win/releases/download/$env:MESA_VERSION/$mesaArchive"
+          & 'C:\Program Files\7-Zip\7z.exe' x $mesaArchive -omesa
+
+          New-Item -ItemType Directory -Force -Path windows-portable | Out-Null
+          Copy-Item ${{ matrix.output }} windows-portable\
+          # Copy available Mesa DLLs (libglapi.dll was merged into opengl32.dll in Mesa 26+)
+          $mesaDlls = @('opengl32.dll', 'libgallium_wgl.dll')
+          foreach ($dll in $mesaDlls) {
+            if (Test-Path "mesa\x64\$dll") {
+              Copy-Item "mesa\x64\$dll" windows-portable\
+              Write-Host "Bundled: $dll"
+            } else {
+              Write-Host "Warning: $dll not found in Mesa archive, skipping"
+            }
+          }
+          Compress-Archive -Path windows-portable\* -DestinationPath muallim-pro-windows-portable.zip -Force
+
+      - name: Package macOS .app and .dmg
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          go install fyne.io/fyne/v2/cmd/fyne@v2.7.4
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          # Build the real .app bundle (metadata/icon come from FyneApp.toml)
+          fyne package -os darwin -icon Icon.png
+          APP=$(ls -d *.app | head -n1)
+          echo "Bundled app: $APP"
+          mkdir -p dmgroot
+          cp -R "$APP" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "MUALLIM PRO" -srcfolder dmgroot -ov -format UDZO \
+            "muallim-pro-${{ steps.version.outputs.VERSION }}-macos.dmg"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-${{ matrix.target }}
+          path: ${{ matrix.output }}
+
+      - name: Upload Windows portable artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-windows-portable
+          path: muallim-pro-windows-portable.zip
+
+      - name: Upload macOS .dmg artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-macos-dmg
+          path: muallim-pro-*-macos.dmg
+
+  package-deb:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: muallim-pro-linux-amd64
+          path: build
+
+      - name: Create .deb package
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          mkdir -p deb/DEBIAN deb/usr/bin deb/usr/share/applications
+          chmod +x build/muallim-pro
+          cp build/muallim-pro deb/usr/bin/
+          cat > deb/DEBIAN/control << EOF
+          Package: muallim-pro
+          Version: ${VERSION}
+          Section: education
+          Priority: optional
+          Architecture: amd64
+          Depends: libgl1, libxcursor1, libxrandr2, libxinerama1, libxi6
+          Maintainer: MUALLIM PRO Team
+          Description: MUALLIM PRO - Automated grade management for edonish.tj
+          EOF
+          cat > deb/usr/share/applications/muallim-pro.desktop << EOF
+          [Desktop Entry]
+          Name=MUALLIM PRO
+          Comment=Automated grade management for edonish.tj
+          Exec=/usr/bin/muallim-pro
+          Icon=muallim-pro
+          Terminal=false
+          Type=Application
+          Categories=Education;
+          EOF
+          dpkg-deb --build deb muallim-pro_${VERSION}_amd64.deb
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-deb-amd64
+          path: muallim-pro_*.deb
+
+  package-rpm:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: muallim-pro-linux-amd64
+          path: build
+
+      - name: Install rpm tools
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Create .rpm package
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          mkdir -p rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          chmod +x build/muallim-pro
+          cp build/muallim-pro rpm/BUILD/
+          cat > rpm/SPECS/muallim-pro.spec << 'SPEC'
+          Name:           muallim-pro
+          Version:        %{version}
+          Release:        1%{?dist}
+          Summary:        MUALLIM PRO - Automated grade management
+          License:        Proprietary
+          Requires:       mesa-libGL libXcursor libXrandr libXinerama libXi
+          %description
+          Desktop application for automated grade management for edonish.tj
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          install -m 755 %{_builddir}/muallim-pro %{buildroot}/usr/bin/muallim-pro
+          %files
+          /usr/bin/muallim-pro
+          SPEC
+          rpmbuild --define "_topdir $(pwd)/rpm" --define "_builddir $(pwd)/rpm/BUILD" --define "version ${VERSION}" -bb rpm/SPECS/muallim-pro.spec
+          cp rpm/RPMS/*/*.rpm muallim-pro_${VERSION}_x86_64.rpm
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-rpm-x86_64
+          path: muallim-pro_*.rpm
+
+  package-appimage:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: muallim-pro-linux-amd64
+          path: build
+
+      - name: Build AppImage
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          chmod +x build/muallim-pro
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp build/muallim-pro AppDir/usr/bin/muallim-pro
+          cp Icon.png AppDir/muallim-pro.png
+          cp Icon.png AppDir/usr/share/icons/hicolor/256x256/apps/muallim-pro.png
+          cat > AppDir/muallim-pro.desktop << 'EOF'
+          [Desktop Entry]
+          Name=MUALLIM PRO
+          Comment=Automated grade management for edonish.tj
+          Exec=muallim-pro
+          Icon=muallim-pro
+          Terminal=false
+          Type=Application
+          Categories=Education;
+          EOF
+          cp AppDir/muallim-pro.desktop AppDir/usr/share/applications/
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "${HERE}/usr/bin/muallim-pro" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir \
+            "muallim-pro-${VERSION}-x86_64.AppImage"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-appimage
+          path: muallim-pro-*-x86_64.AppImage
+
+  build-android:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Point to Android NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+
+      - name: Install fyne CLI
+        run: go install fyne.io/fyne/v2/cmd/fyne@v2.7.4
+
+      - name: Build APK
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          fyne package -os android -appID com.muallim.pro -icon Icon.png
+          APK=$(find . -maxdepth 1 -name '*.apk' | head -n1)
+          mv "$APK" "muallim-pro-${VERSION}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muallim-pro-android-apk
+          path: muallim-pro-*.apk
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build, package-deb, package-rpm, package-appimage, build-android]
+    # Run as long as the core cross-platform build succeeded, even if one of the
+    # packaging jobs (e.g. the experimental Android APK) failed — the release
+    # then attaches whatever artifacts were produced instead of being cancelled.
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List release files
+        run: find dist -type f | sort
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
+          draft: false

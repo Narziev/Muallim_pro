@@ -1,0 +1,56 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Output
+output/
+
+# Session
+.muallim_pro_session.json
+
+# Docker
+.docker/
+
+# Secrets
+.env
+
+# Build artifacts
+dist/
+build/
+release/
+download/
+muallim-pro/
+muallim-pro-repo/
+
+# Go binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go workspace
+go.work
+
+# Go cache
+/pkg/mod
+
+# Fyne cache
+.fyne/
+tool-results/
+
+# Local build sysroot
+.sysroot/
+.libs/
+muallim-pro
