@@ -24,7 +24,7 @@ import (
 
 // AppVersion is shown in the header. (It used to be hard-coded as "v5.4.6"
 // even in the v5.5.5 release.)
-const AppVersion = "v5.5.7"
+const AppVersion = "v5.5.8"
 
 var (
         colorNavBG    = color.NRGBA{R: 15, G: 23, B: 42, A: 255}    // Slate-900

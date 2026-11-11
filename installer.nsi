@@ -4,7 +4,7 @@
 ; ═══════════════════════════════════════════════════════════════════
 
 !define APPNAME "MUALLIM PRO"
-!define APPVERSION "5.5.7"
+!define APPVERSION "5.5.8"
 !define APPEXE "muallim-pro.exe"
 !define CLIBINARY "muallim-pro-cli.exe"
 !define COMPANY "MUALLIM PRO Team"
