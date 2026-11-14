@@ -21,9 +21,9 @@ import (
 // ------------------------------------------
 
 // saveConcurrency controls how many /journal/assignment/update requests run
-// in parallel. 8 is a safe value that won't trip the server's rate-limiter
-// but turns a 40-date year from ~40 sequential round-trips into ~5 batches.
-const saveConcurrency = 8
+// in parallel. 4 keeps us under the server rate-limiter (8 caused HTTP 429)
+// but turns a 40-date year from ~40 sequential round-trips into ~10 batches.
+const saveConcurrency = 4
 
 type TopicsTab struct {
         controller Controller
@@ -416,8 +416,8 @@ func (t *TopicsTab) onSaveTopics() {
 
 // executeSaveTopics sends UpdateAssignment for every date in parallel using a
 // worker pool. Previously this was a sequential loop — each request waited for
-// the previous to complete, so 40 dates × ~500ms RTT = ~20 seconds. With 8
-// workers it drops to ~3 seconds.
+// the previous to complete, so 40 dates × ~500ms RTT = ~20 seconds. With 4
+// workers it drops to ~5 seconds.
 //
 // Existing topics and ДЗ ARE overwritten — the server treats
 // /journal/assignment/update as a PUT-style upsert.

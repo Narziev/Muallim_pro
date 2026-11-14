@@ -7,6 +7,7 @@ import (
         "fmt"
         "io"
         "log"
+        "math/rand"
         "net/http"
         "net/url"
         "strconv"
@@ -222,7 +223,7 @@ type MuallimClient struct {
         RolePrefix   string
         Schools      []School
 
-        // tokenMu guards JWTToken/RefreshToken. The UI runs up to 8 workers in
+        // tokenMu guards JWTToken/RefreshToken. The UI runs up to 4 workers in
         // parallel; when the JWT expires they all get 401 at once. Without this
         // lock every worker would call RefreshJWT simultaneously (data race on
         // the token fields, and a rotated refresh token makes all but the first
@@ -447,7 +448,9 @@ func (c *MuallimClient) doRequest(req *http.Request, body interface{}) ([]byte, 
 
         // send performs one attempt and returns the token it used, so a 401 can
         // be matched against the token that was actually rejected.
+        retryAfter := "" // Retry-After header of the last response (for 429)
         send := func() ([]byte, int, string, error) {
+                retryAfter = ""
                 token := ""
                 if !explicitAuth {
                         token = c.currentToken()
@@ -468,6 +471,7 @@ func (c *MuallimClient) doRequest(req *http.Request, body interface{}) ([]byte, 
                         return nil, 0, token, err
                 }
                 defer resp.Body.Close()
+                retryAfter = resp.Header.Get("Retry-After")
                 b, err := io.ReadAll(resp.Body)
                 return b, resp.StatusCode, token, err
         }
@@ -485,6 +489,27 @@ func (c *MuallimClient) doRequest(req *http.Request, body interface{}) ([]byte, 
                                 return respBody, status, err
                         }
                 }
+        }
+
+        // Rate limited (429 Too Many Requests): wait and retry a few times
+        // instead of failing. Honors Retry-After (seconds, capped at 10s),
+        // otherwise backs off 1s → 2s → 4s. Random jitter keeps parallel
+        // workers from retrying in lockstep.
+        for attempt := 0; status == http.StatusTooManyRequests && attempt < 3; attempt++ {
+                wait := time.Second << attempt
+                if secs, convErr := strconv.Atoi(strings.TrimSpace(retryAfter)); convErr == nil && secs > 0 {
+                        wait = time.Duration(min(secs, 10)) * time.Second
+                }
+                wait += time.Duration(rand.Int63n(int64(300 * time.Millisecond)))
+                log.Printf("429 от сервера, повтор через %v (попытка %d/3)", wait.Round(time.Millisecond), attempt+1)
+                time.Sleep(wait)
+                respBody, status, _, err = send()
+                if err != nil {
+                        return respBody, status, err
+                }
+        }
+        if status == http.StatusTooManyRequests {
+                return respBody, status, fmt.Errorf("сервер перегружен (код 429: слишком много запросов), попробуйте позже")
         }
 
         // Checked AFTER the retry too — previously a failed retry (e.g. 422/500)

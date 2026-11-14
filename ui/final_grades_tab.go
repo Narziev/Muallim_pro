@@ -879,7 +879,7 @@ func (t *FinalGradesTab) executeAcceptRecommendations(ctx finalCtx) {
         close(jobs)
 
         // Step 3: Worker pool processes jobs in parallel.
-        const concurrency = 8
+        const concurrency = 4 // 8 caused HTTP 429 (Too Many Requests)
         var successCount, skipCount, failCount int32
         var firstErrMsg string
         var firstErrSet int32
